@@ -59,6 +59,18 @@
   progress { width: 100%; height: 10px; margin-top: 16px; display: none; }
   #status { margin-top: 14px; min-height: 1.5em; font-size: 17px; }
   #status.ok { color: var(--ok); } #status.bad { color: var(--bad); }
+  #debug { margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--line); font-size: 14px; color: var(--muted); }
+  #copyReport {
+    background: none; border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px;
+    color: var(--text); font: inherit; cursor: pointer;
+  }
+  #copied { margin-left: 10px; }
+  #reportBox {
+    display: block; width: 100%; height: 220px; margin-top: 12px; padding: 8px;
+    background: var(--card); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+    font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace;
+  }
+  #reportBox[hidden] { display: none; }
   #details { margin-top: 6px; color: var(--muted); font-size: 13px; font-family: ui-monospace, Menlo, Consolas, monospace; }
   #nochrome {
     display: none; background: var(--card); border: 1px solid var(--line);
@@ -84,6 +96,12 @@
   <progress id="bar" max="240" value="0"></progress>
   <div id="status"></div>
   <div id="details"></div>
+
+  <div id="debug">
+    <button id="copyReport" type="button">Copy troubleshooting report</button>
+    <span id="copied"></span>
+    <textarea id="reportBox" readonly hidden></textarea>
+  </div>
 </main>
 
 <script>
@@ -96,16 +114,79 @@ const $ = id => document.getElementById(id);
 const drop = $("drop"), fileInput = $("file"), sendBtn = $("send");
 const bar = $("bar"), statusEl = $("status"), preview = $("preview");
 
+const VERSION = "2026-10-14.3";
+
 let pixels = null;   // Uint8Array, W*H*2 bytes, RGB565 big-endian
 let busy = false;
+
+// ---------- troubleshooting log ----------
+// Everything that happens is logged here (in memory only; nothing leaves the
+// page). "Copy troubleshooting report" puts it on the clipboard so the
+// designer can paste it into a message.
+
+const debugLog = [];
+const t0page = performance.now();
+function dbg(msg) {
+  const t = ((performance.now() - t0page) / 1000).toFixed(3).padStart(8);
+  debugLog.push(`${t}s  ${msg}`);
+  if (debugLog.length > 2000) debugLog.splice(0, debugLog.length - 2000);
+}
+const errText = e => e ? `${e.name || "Error"}: ${e.message || e}` : "unknown error";
 
 function setStatus(text, kind) {
   statusEl.textContent = text;
   statusEl.className = kind || "";
+  dbg(`status: ${text}`);
 }
 
+async function buildReport() {
+  const lines = [
+    "Send to Screen - troubleshooting report",
+    `page version: ${VERSION}`,
+    `time: ${new Date().toISOString()}`,
+    `url: ${location.href}`,
+    `browser: ${navigator.userAgent}`,
+    `platform: ${(navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform}`,
+    `web serial: ${"serial" in navigator ? "yes" : "NO"}`,
+  ];
+  if ("serial" in navigator) {
+    try {
+      const ports = await navigator.serial.getPorts();
+      lines.push(`allowed ports: ${ports.length ? ports.map(p => JSON.stringify(p.getInfo())).join(", ") : "none"}`);
+    } catch (e) { lines.push(`allowed ports: ${errText(e)}`); }
+  }
+  lines.push(`status shown: ${statusEl.textContent || "-"}`);
+  if ($("details").textContent) lines.push($("details").textContent);
+  lines.push("", "log:", ...debugLog);
+  return lines.join("\n");
+}
+
+$("copyReport").addEventListener("click", async () => {
+  const report = await buildReport();
+  const box = $("reportBox");
+  box.value = report;
+  try {
+    await navigator.clipboard.writeText(report);
+    $("copied").textContent = "Copied. Paste it into a message to Ariel.";
+    box.hidden = true;
+  } catch {
+    // Clipboard blocked: show the text so it can be copied by hand.
+    $("copied").textContent = "Select all the text below, copy it, and paste it into a message to Ariel.";
+    box.hidden = false;
+    box.select();
+  }
+});
+
+window.addEventListener("error", e => dbg(`page error: ${e.message} (${e.filename}:${e.lineno})`));
+window.addEventListener("unhandledrejection", e => dbg(`unhandled: ${errText(e.reason)}`));
+
+dbg(`page loaded, version ${VERSION}`);
 if (!("serial" in navigator)) {
   $("nochrome").style.display = "block";
+  dbg("web serial not available in this browser");
+} else {
+  navigator.serial.addEventListener("connect", e => dbg(`usb device connected: ${JSON.stringify(e.target.getInfo())}`));
+  navigator.serial.addEventListener("disconnect", e => dbg(`usb device disconnected: ${JSON.stringify(e.target.getInfo())}`));
 }
 
 // ---------- picking the PNG ----------
@@ -127,14 +208,17 @@ async function loadFile(file) {
   if (busy) return;
   pixels = null;
   sendBtn.disabled = true;
+  dbg(`file: "${file.name}", type ${file.type || "?"}, ${file.size} bytes`);
   let img;
   try {
     // No colour-profile conversion: the screen gets the PNG's own pixel values.
     img = await createImageBitmap(file, { colorSpaceConversion: "none", premultiplyAlpha: "none" });
-  } catch {
+  } catch (e) {
+    dbg(`decode failed: ${errText(e)}`);
     showRejected(file.name, "This isn't an image Chrome can open. Export it as a PNG.");
     return;
   }
+  dbg(`image is ${img.width} x ${img.height}`);
   if (img.width !== W || img.height !== H) {
     const hint = (img.width === W * 2 && img.height === H * 2)
       ? "It looks like a 2x export. Export at 1x."
@@ -147,6 +231,7 @@ async function loadFile(file) {
   ctx.fillRect(0, 0, W, H);
   ctx.drawImage(img, 0, 0);
   pixels = toRgb565(ctx.getImageData(0, 0, W, H).data);
+  dbg(`converted to RGB565, checksum ${fnv1a(pixels)}, first pixels ${hex(pixels.subarray(0, 8))}`);
   preview.style.display = "block";
   $("dropText").textContent = file.name;
   $("dropHint").textContent = "Drop another PNG to replace it";
@@ -159,6 +244,13 @@ function showRejected(name, why) {
   $("dropText").textContent = name;
   $("dropHint").textContent = "Drop a different PNG";
   setStatus(why, "bad");
+}
+
+// Short fingerprint of the pixels, so two reports can be checked for the same image.
+function fnv1a(bytes) {
+  let h = 0x811c9dc5;
+  for (const b of bytes) h = Math.imul(h ^ b, 0x01000193) >>> 0;
+  return h.toString(16).padStart(8, "0");
 }
 
 function toRgb565(rgba) {
@@ -184,15 +276,18 @@ class Link {
     this.waiters = [];
   }
   async open() {
+    dbg(`opening port ${JSON.stringify(this.port.getInfo())} at ${BAUD} baud`);
     await this.port.open({ baudRate: BAUD });
+    dbg("port open");
     // Opening the port raises the adaptor's control lines, which resets the
     // screen; lowering them lets it start up again.
     try {
       await this.port.setSignals({ dataTerminalReady: false, requestToSend: false });
       this.signals = "lines low";
     } catch (e) {
-      this.signals = `setSignals failed: ${e.message}`;
+      this.signals = `setSignals failed: ${errText(e)}`;
     }
+    dbg(`control lines: ${this.signals}`);
     this.writer = this.port.writable.getWriter();
     this.reader = this.port.readable.getReader();
     this.pumping = this.pump();
@@ -202,12 +297,18 @@ class Link {
       for (;;) {
         const { value, done } = await this.reader.read();
         if (done) break;
+        dbg(`RX ${value.length} bytes: ${hex(value.subarray(0, 32))}${value.length > 32 ? " …" : ""}`);
         for (const b of value) this.buf.push(b);
         this.waiters.slice().forEach(w => w());
       }
-    } catch {}
+    } catch (e) {
+      dbg(`read stopped: ${errText(e)}`);
+    }
   }
-  write(bytes) { return this.writer.write(bytes); }
+  write(bytes) {
+    dbg(`TX ${bytes.length} bytes: ${hex(bytes.subarray(0, 10))}${bytes.length > 10 ? " …" : ""}`);
+    return this.writer.write(bytes);
+  }
   drain() { this.buf.length = 0; }
   read(n, ms) {
     return new Promise((resolve, reject) => {
@@ -221,6 +322,7 @@ class Link {
     });
   }
   async close() {
+    dbg("closing port");
     try { await this.reader.cancel(); } catch {}
     try { this.reader.releaseLock(); } catch {}
     try { this.writer.releaseLock(); } catch {}
@@ -232,10 +334,19 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function pickPort() {
   const granted = await navigator.serial.getPorts();
+  dbg(`allowed ports: ${granted.length ? granted.map(p => JSON.stringify(p.getInfo())).join(", ") : "none"}`);
   const known = granted.find(p => p.getInfo().usbVendorId === SILABS_VENDOR) || granted[0];
   if (known) return known;
   // First time only: Chrome asks which device to use.
-  return navigator.serial.requestPort({ filters: [{ usbVendorId: SILABS_VENDOR }] });
+  dbg("asking which device to use");
+  try {
+    const port = await navigator.serial.requestPort({ filters: [{ usbVendorId: SILABS_VENDOR }] });
+    dbg(`chosen: ${JSON.stringify(port.getInfo())}`);
+    return port;
+  } catch (e) {
+    dbg(`no device chosen: ${errText(e)}`);
+    throw e;
+  }
 }
 
 const hex = bytes => Array.from(bytes, b => b.toString(16).padStart(2, "0")).join(" ") || "nothing";
@@ -244,9 +355,11 @@ const hex = bytes => Array.from(bytes, b => b.toString(16).padStart(2, "0")).joi
 // section 2.5). Anything sent before it is ready can leave its command reader
 // out of step, so wait in silence first, then ask for its model name.
 async function hello(link) {
+  dbg(`waiting ${BOOT_MS} ms for the screen to start`);
   await sleep(BOOT_MS);
   let heard = [];
   for (let attempt = 0; attempt < 2; attempt++) {
+    dbg(`asking for display model, attempt ${attempt + 1}`);
     heard = heard.concat(link.buf.splice(0));
     await link.write(new Uint8Array([0x00, 0x1a]));
     try {
@@ -309,14 +422,20 @@ sendBtn.addEventListener("click", async () => {
     link = new Link(port);
     setStatus("Connecting to the screen…");
     try { await link.open(); }
-    catch { link = null; throw new ScreenError("Couldn't open the screen's connection. Close any other program using it (such as Workshop4), then try again."); }
+    catch (e) {
+      dbg(`open failed: ${errText(e)}`);
+      link = null;
+      throw new ScreenError("Couldn't open the screen's connection. Close any other program using it (such as Workshop4), then try again.", errText(e));
+    }
     setStatus("Waiting for the screen to start…");
     const model = await hello(link);
     setStatus(`Sending to ${model}…`);
     const t0 = performance.now();
     await sendPicture(link, pixels);
+    dbg(`picture sent in ${((performance.now() - t0) / 1000).toFixed(1)} s, checksum ${fnv1a(pixels)}`);
     setStatus(`Done. The screen is showing your design (${((performance.now() - t0) / 1000).toFixed(0)} s).`, "ok");
   } catch (e) {
+    dbg(`failed: ${errText(e)}${e.details ? ` (${e.details})` : ""}`);
     setStatus(e instanceof ScreenError ? e.message : `Something went wrong: ${e.message}`, "bad");
     $("details").textContent = e.details ? `Details for your engineer: ${e.details}` : "";
   } finally {

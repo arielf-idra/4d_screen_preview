@@ -16,6 +16,14 @@ Microsoft Edge. Safari doesn't support Web Serial.
 
 A full screen takes about 18 seconds, including about 3.5 seconds while the screen restarts.
 
+## Troubleshooting
+
+The page logs every step: the file checks, which USB device was used, and every
+byte sent to and received from the screen (pixel data abbreviated). **Copy
+troubleshooting report** at the bottom of the page copies that log plus the
+browser and OS version. The log stays in the page until then; nothing is sent
+anywhere.
+
 ## How it works
 
 Everything runs in the browser; nothing is uploaded anywhere. The page decodes
