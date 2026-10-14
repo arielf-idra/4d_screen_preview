@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Send to Screen</title>
+<!--
+  Sends a 320x240 PNG to the TheraDrain 4D display (gen4-uLCD-32DCT-CLB running
+  Diablo16 SPE at 115200 baud) over its USB adaptor, using Chrome's Web Serial.
+
+  Protocol (DIABLO-16 Serial SPE Command Set rev 2.4), each command answered
+  before the next is sent:
+    Get Display Model  00 1A                    -> 06, u16 count, name
+    Screen Mode        FF 42 00 00 (landscape)  -> 06, u16 previous mode
+    Clear Screen       FF 82                    -> 06
+    Blit Com to Display 00 23 x y w h + RGB565 big-endian pixels -> 06
+  Pixels are sent 8 rows per blit. Verified on the real screen 2026-10-14
+  (RGB565 MSB first, no red/blue swap, ~13.5 s per frame).
+-->
+<style>
+  :root {
+    --bg: #f6f6f4; --card: #ffffff; --text: #1d1d1f; --muted: #6b6b70;
+    --line: #d9d9dc; --accent: #2457d6; --accent-text: #ffffff;
+    --ok: #1d7a3a; --bad: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161618; --card: #222225; --text: #f2f2f4; --muted: #a0a0a8;
+      --line: #3a3a3f; --accent: #5b8cff; --accent-text: #0d0d10;
+      --ok: #5fd07f; --bad: #ff8a80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  main { max-width: 720px; margin: 0 auto; padding: 32px 16px 48px; }
+  h1 { font-size: 28px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  #drop {
+    background: var(--card); border: 2px dashed var(--line); border-radius: 14px;
+    min-height: 300px; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 12px; padding: 20px; cursor: pointer; text-align: center;
+  }
+  #drop.over { border-color: var(--accent); }
+  #drop .big { font-size: 20px; font-weight: 600; }
+  #drop .hint { color: var(--muted); font-size: 14px; }
+  canvas {
+    width: 100%; max-width: 640px; aspect-ratio: 4 / 3; image-rendering: pixelated;
+    border-radius: 6px; display: none; background: #000;
+  }
+  #send {
+    margin-top: 20px; width: 100%; font-size: 20px; font-weight: 600; padding: 16px;
+    border: 0; border-radius: 12px; background: var(--accent); color: var(--accent-text);
+    cursor: pointer;
+  }
+  #send:disabled { opacity: .4; cursor: default; }
+  progress { width: 100%; height: 10px; margin-top: 16px; display: none; }
+  #status { margin-top: 14px; min-height: 1.5em; font-size: 17px; }
+  #status.ok { color: var(--ok); } #status.bad { color: var(--bad); }
+  #nochrome {
+    display: none; background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 16px; margin-bottom: 20px; color: var(--bad);
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Send to Screen</h1>
+  <p class="sub">Drop a 320 × 240 PNG, then click Send. The screen updates in about 15 seconds.</p>
+
+  <div id="nochrome">This page needs <b>Google Chrome</b> (or Microsoft Edge). Open it in Chrome and try again.</div>
+
+  <div id="drop" tabindex="0">
+    <canvas id="preview" width="320" height="240"></canvas>
+    <div class="big" id="dropText">Drop your PNG here</div>
+    <div class="hint" id="dropHint">or click to choose a file</div>
+  </div>
+  <input type="file" id="file" accept="image/png" hidden>
+
+  <button id="send" disabled>Send to screen</button>
+  <progress id="bar" max="240" value="0"></progress>
+  <div id="status"></div>
+</main>
+
+<script>
+"use strict";
+const W = 320, H = 240, ROWS = 8, BAUD = 115200;
+const SILABS_VENDOR = 0x10c4;   // the screen's USB adaptor (CP2102)
+
+const $ = id => document.getElementById(id);
+const drop = $("drop"), fileInput = $("file"), sendBtn = $("send");
+const bar = $("bar"), statusEl = $("status"), preview = $("preview");
+
+let pixels = null;   // Uint8Array, W*H*2 bytes, RGB565 big-endian
+let busy = false;
+
+function setStatus(text, kind) {
+  statusEl.textContent = text;
+  statusEl.className = kind || "";
+}
+
+if (!("serial" in navigator)) {
+  $("nochrome").style.display = "block";
+}
+
+// ---------- picking the PNG ----------
+
+drop.addEventListener("click", () => fileInput.click());
+drop.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") fileInput.click(); });
+fileInput.addEventListener("change", () => { if (fileInput.files[0]) loadFile(fileInput.files[0]); fileInput.value = ""; });
+drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", e => {
+  e.preventDefault(); drop.classList.remove("over");
+  if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+});
+// A file dropped anywhere else must not navigate away from the page.
+window.addEventListener("dragover", e => e.preventDefault());
+window.addEventListener("drop", e => e.preventDefault());
+
+async function loadFile(file) {
+  if (busy) return;
+  pixels = null;
+  sendBtn.disabled = true;
+  let img;
+  try {
+    // No colour-profile conversion: the screen gets the PNG's own pixel values.
+    img = await createImageBitmap(file, { colorSpaceConversion: "none", premultiplyAlpha: "none" });
+  } catch {
+    showRejected(file.name, "This isn't an image Chrome can open. Export it as a PNG.");
+    return;
+  }
+  if (img.width !== W || img.height !== H) {
+    const hint = (img.width === W * 2 && img.height === H * 2)
+      ? "It looks like a 2x export. Export at 1x."
+      : "Export the screen at exactly 320 × 240.";
+    showRejected(file.name, `This image is ${img.width} × ${img.height}. ${hint}`);
+    return;
+  }
+  const ctx = preview.getContext("2d");
+  ctx.fillStyle = "#000";                 // transparent areas show as black on the screen too
+  ctx.fillRect(0, 0, W, H);
+  ctx.drawImage(img, 0, 0);
+  pixels = toRgb565(ctx.getImageData(0, 0, W, H).data);
+  preview.style.display = "block";
+  $("dropText").textContent = file.name;
+  $("dropHint").textContent = "Drop another PNG to replace it";
+  sendBtn.disabled = !("serial" in navigator);
+  setStatus("Ready. Click Send to screen.");
+}
+
+function showRejected(name, why) {
+  preview.style.display = "none";
+  $("dropText").textContent = name;
+  $("dropHint").textContent = "Drop a different PNG";
+  setStatus(why, "bad");
+}
+
+function toRgb565(rgba) {
+  const out = new Uint8Array(W * H * 2);
+  for (let i = 0, o = 0; i < rgba.length; i += 4, o += 2) {
+    const v = ((rgba[i] >> 3) << 11) | ((rgba[i + 1] >> 2) << 5) | (rgba[i + 2] >> 3);
+    out[o] = v >> 8;
+    out[o + 1] = v & 0xff;
+  }
+  return out;
+}
+
+// ---------- serial link ----------
+
+class ScreenError extends Error {}
+
+class Link {
+  constructor(port) {
+    this.port = port;
+    this.buf = [];
+    this.waiters = [];
+  }
+  async open() {
+    await this.port.open({ baudRate: BAUD });
+    // Keep the adaptor's control lines low; on some adaptors they reset the screen.
+    try { await this.port.setSignals({ dataTerminalReady: false, requestToSend: false }); } catch {}
+    this.writer = this.port.writable.getWriter();
+    this.reader = this.port.readable.getReader();
+    this.pumping = this.pump();
+  }
+  async pump() {
+    try {
+      for (;;) {
+        const { value, done } = await this.reader.read();
+        if (done) break;
+        for (const b of value) this.buf.push(b);
+        this.waiters.slice().forEach(w => w());
+      }
+    } catch {}
+  }
+  write(bytes) { return this.writer.write(bytes); }
+  drain() { this.buf.length = 0; }
+  read(n, ms) {
+    return new Promise((resolve, reject) => {
+      const check = () => {
+        if (this.buf.length >= n) { done(); resolve(Uint8Array.from(this.buf.splice(0, n))); }
+      };
+      const timer = setTimeout(() => { done(); reject(new ScreenError("timeout")); }, ms);
+      const done = () => { clearTimeout(timer); this.waiters = this.waiters.filter(w => w !== check); };
+      this.waiters.push(check);
+      check();
+    });
+  }
+  async close() {
+    try { await this.reader.cancel(); } catch {}
+    try { this.reader.releaseLock(); } catch {}
+    try { this.writer.releaseLock(); } catch {}
+    try { await this.port.close(); } catch {}
+  }
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function pickPort() {
+  const granted = await navigator.serial.getPorts();
+  const known = granted.find(p => p.getInfo().usbVendorId === SILABS_VENDOR) || granted[0];
+  if (known) return known;
+  // First time only: Chrome asks which device to use.
+  return navigator.serial.requestPort({ filters: [{ usbVendorId: SILABS_VENDOR }] });
+}
+
+// Ask the screen for its model name until it answers. Retrying for ~10 s also
+// covers a screen that restarts when the port opens (it needs ~3 s to boot).
+async function hello(link) {
+  const until = Date.now() + 10000;
+  while (Date.now() < until) {
+    link.drain();
+    await link.write(new Uint8Array([0x00, 0x1a]));
+    try {
+      const head = await link.read(3, 800);
+      if (head[0] === 0x06) {
+        const name = await link.read((head[1] << 8) | head[2], 800);
+        return new TextDecoder().decode(name);
+      }
+    } catch {}
+    await sleep(400);
+  }
+  throw new ScreenError("The screen didn't answer. Check that its USB cable is plugged in, wait 5 seconds, and try again.");
+}
+
+async function expectAck(link, n, what) {
+  let r;
+  try { r = await link.read(n, 4000); }
+  catch { throw new ScreenError(`The screen stopped answering (${what}). Unplug its USB cable, plug it back in, wait 5 seconds, and try again.`); }
+  if (r[0] !== 0x06) throw new ScreenError(`The screen rejected the picture (${what}). Unplug its USB cable, plug it back in, and try again.`);
+}
+
+async function sendPicture(link, px) {
+  await link.write(new Uint8Array([0xff, 0x42, 0x00, 0x00]));   // landscape
+  await expectAck(link, 3, "screen mode");
+  await link.write(new Uint8Array([0xff, 0x82]));               // clear screen
+  await expectAck(link, 1, "clear");
+  for (let y = 0; y < H; y += ROWS) {
+    const n = Math.min(ROWS, H - y);
+    const pkt = new Uint8Array(10 + W * n * 2);
+    pkt.set([0x00, 0x23, 0, 0, y >> 8, y & 0xff, W >> 8, W & 0xff, n >> 8, n & 0xff]);
+    pkt.set(px.subarray(y * W * 2, (y + n) * W * 2), 10);
+    await link.write(pkt);
+    await expectAck(link, 1, `row ${y}`);
+    bar.value = y + n;
+  }
+}
+
+sendBtn.addEventListener("click", async () => {
+  if (!pixels || busy) return;
+  busy = true;
+  sendBtn.disabled = true;
+  bar.value = 0;
+  bar.style.display = "block";
+  let link = null;
+  try {
+    let port;
+    try { port = await pickPort(); }
+    catch { throw new ScreenError("No screen selected. If the list was empty, check the screen's USB cable and try again."); }
+    link = new Link(port);
+    setStatus("Connecting to the screen…");
+    try { await link.open(); }
+    catch { link = null; throw new ScreenError("Couldn't open the screen's connection. Close any other program using it (such as Workshop4), then try again."); }
+    const model = await hello(link);
+    setStatus(`Sending to ${model}…`);
+    const t0 = performance.now();
+    await sendPicture(link, pixels);
+    setStatus(`Done. The screen is showing your design (${((performance.now() - t0) / 1000).toFixed(0)} s).`, "ok");
+  } catch (e) {
+    setStatus(e instanceof ScreenError ? e.message : `Something went wrong: ${e.message}`, "bad");
+  } finally {
+    if (link) await link.close();
+    busy = false;
+    sendBtn.disabled = !pixels;
+  }
+});
+</script>
+</body>
+</html>
