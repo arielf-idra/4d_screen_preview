@@ -114,7 +114,7 @@ const $ = id => document.getElementById(id);
 const drop = $("drop"), fileInput = $("file"), sendBtn = $("send");
 const bar = $("bar"), statusEl = $("status"), preview = $("preview");
 
-const VERSION = "2026-10-14.3";
+const VERSION = "2026-10-14.4";
 
 let pixels = null;   // Uint8Array, W*H*2 bytes, RGB565 big-endian
 let busy = false;
@@ -374,7 +374,9 @@ async function hello(link) {
   }
   heard = heard.concat(link.buf.splice(0));
   throw new ScreenError(
-    "The screen didn't answer. Unplug its USB cable, plug it back in, wait 5 seconds, and try again.",
+    heard.length
+      ? "The screen answered in a way this page doesn't understand. Unplug its USB cable, plug it back in, wait 5 seconds, and try again."
+      : "The screen didn't answer. Check its USB cable and try again. If it still doesn't answer, the screen may need its preview software loaded: click Copy troubleshooting report below and send it to Ariel.",
     `${link.signals}; received: ${hex(heard)}`);
 }
 

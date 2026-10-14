@@ -49,7 +49,7 @@ answered before the next is sent:
 2. **File → New**, choose the display model, then the **Serial** environment.
 3. **Tools → SPE Load**.
 
-This replaces any Designer/ViSi program on the display.
+This replaces any Designer/ViSi program on the display. **A display without SPE never answers:** the page reports "The screen didn't answer" and the report shows `received: nothing`.
 
 ## Tested
 
@@ -59,4 +59,4 @@ This replaces any Designer/ViSi program on the display.
 | Colour order | RGB565, most significant byte first; no red/blue swap |
 | Protocol | Verified on the real screen from Windows with a test script; 13.5 s per frame |
 | This page | Works on the real screen from Chrome on Windows (2026-10-14) |
-| macOS | Not yet tested |
+| macOS | Chrome 151 on macOS sees the CP210x adaptor with no driver install and opens it; full send not yet tested (the board tried had no SPE) |
