@@ -59,6 +59,7 @@
   progress { width: 100%; height: 10px; margin-top: 16px; display: none; }
   #status { margin-top: 14px; min-height: 1.5em; font-size: 17px; }
   #status.ok { color: var(--ok); } #status.bad { color: var(--bad); }
+  #details { margin-top: 6px; color: var(--muted); font-size: 13px; font-family: ui-monospace, Menlo, Consolas, monospace; }
   #nochrome {
     display: none; background: var(--card); border: 1px solid var(--line);
     border-radius: 12px; padding: 16px; margin-bottom: 20px; color: var(--bad);
@@ -68,7 +69,7 @@
 <body>
 <main>
   <h1>Send to Screen</h1>
-  <p class="sub">Drop a 320 × 240 PNG, then click Send. The screen updates in about 15 seconds.</p>
+  <p class="sub">Drop a 320 × 240 PNG, then click Send. The screen updates in about 20 seconds.</p>
 
   <div id="nochrome">This page needs <b>Google Chrome</b> (or Microsoft Edge). Open it in Chrome and try again.</div>
 
@@ -82,11 +83,13 @@
   <button id="send" disabled>Send to screen</button>
   <progress id="bar" max="240" value="0"></progress>
   <div id="status"></div>
+  <div id="details"></div>
 </main>
 
 <script>
 "use strict";
 const W = 320, H = 240, ROWS = 8, BAUD = 115200;
+const BOOT_MS = 3500;           // screen start-up time after the port opens
 const SILABS_VENDOR = 0x10c4;   // the screen's USB adaptor (CP2102)
 
 const $ = id => document.getElementById(id);
@@ -170,7 +173,9 @@ function toRgb565(rgba) {
 
 // ---------- serial link ----------
 
-class ScreenError extends Error {}
+class ScreenError extends Error {
+  constructor(message, details) { super(message); this.details = details; }
+}
 
 class Link {
   constructor(port) {
@@ -180,8 +185,14 @@ class Link {
   }
   async open() {
     await this.port.open({ baudRate: BAUD });
-    // Keep the adaptor's control lines low; on some adaptors they reset the screen.
-    try { await this.port.setSignals({ dataTerminalReady: false, requestToSend: false }); } catch {}
+    // Opening the port raises the adaptor's control lines, which resets the
+    // screen; lowering them lets it start up again.
+    try {
+      await this.port.setSignals({ dataTerminalReady: false, requestToSend: false });
+      this.signals = "lines low";
+    } catch (e) {
+      this.signals = `setSignals failed: ${e.message}`;
+    }
     this.writer = this.port.writable.getWriter();
     this.reader = this.port.readable.getReader();
     this.pumping = this.pump();
@@ -227,30 +238,44 @@ async function pickPort() {
   return navigator.serial.requestPort({ filters: [{ usbVendorId: SILABS_VENDOR }] });
 }
 
-// Ask the screen for its model name until it answers. Retrying for ~10 s also
-// covers a screen that restarts when the port opens (it needs ~3 s to boot).
+const hex = bytes => Array.from(bytes, b => b.toString(16).padStart(2, "0")).join(" ") || "nothing";
+
+// Opening the port restarts the screen, which takes about 3 s (SPE manual,
+// section 2.5). Anything sent before it is ready can leave its command reader
+// out of step, so wait in silence first, then ask for its model name.
 async function hello(link) {
-  const until = Date.now() + 10000;
-  while (Date.now() < until) {
-    link.drain();
+  await sleep(BOOT_MS);
+  let heard = [];
+  for (let attempt = 0; attempt < 2; attempt++) {
+    heard = heard.concat(link.buf.splice(0));
     await link.write(new Uint8Array([0x00, 0x1a]));
     try {
-      const head = await link.read(3, 800);
+      const head = await link.read(3, 1500);
       if (head[0] === 0x06) {
-        const name = await link.read((head[1] << 8) | head[2], 800);
+        const name = await link.read((head[1] << 8) | head[2], 1000);
         return new TextDecoder().decode(name);
       }
+      heard = heard.concat(Array.from(head));
     } catch {}
-    await sleep(400);
+    await sleep(1500);
   }
-  throw new ScreenError("The screen didn't answer. Check that its USB cable is plugged in, wait 5 seconds, and try again.");
+  heard = heard.concat(link.buf.splice(0));
+  throw new ScreenError(
+    "The screen didn't answer. Unplug its USB cable, plug it back in, wait 5 seconds, and try again.",
+    `${link.signals}; received: ${hex(heard)}`);
 }
 
 async function expectAck(link, n, what) {
   let r;
   try { r = await link.read(n, 4000); }
-  catch { throw new ScreenError(`The screen stopped answering (${what}). Unplug its USB cable, plug it back in, wait 5 seconds, and try again.`); }
-  if (r[0] !== 0x06) throw new ScreenError(`The screen rejected the picture (${what}). Unplug its USB cable, plug it back in, and try again.`);
+  catch {
+    throw new ScreenError("The screen stopped answering. Unplug its USB cable, plug it back in, wait 5 seconds, and try again.",
+      `no reply to ${what}; pending: ${hex(link.buf)}`);
+  }
+  if (r[0] !== 0x06) {
+    throw new ScreenError("The screen rejected the picture. Unplug its USB cable, plug it back in, wait 5 seconds, and try again.",
+      `reply to ${what}: ${hex(r)}`);
+  }
 }
 
 async function sendPicture(link, px) {
@@ -275,6 +300,7 @@ sendBtn.addEventListener("click", async () => {
   sendBtn.disabled = true;
   bar.value = 0;
   bar.style.display = "block";
+  $("details").textContent = "";
   let link = null;
   try {
     let port;
@@ -284,6 +310,7 @@ sendBtn.addEventListener("click", async () => {
     setStatus("Connecting to the screen…");
     try { await link.open(); }
     catch { link = null; throw new ScreenError("Couldn't open the screen's connection. Close any other program using it (such as Workshop4), then try again."); }
+    setStatus("Waiting for the screen to start…");
     const model = await hello(link);
     setStatus(`Sending to ${model}…`);
     const t0 = performance.now();
@@ -291,6 +318,7 @@ sendBtn.addEventListener("click", async () => {
     setStatus(`Done. The screen is showing your design (${((performance.now() - t0) / 1000).toFixed(0)} s).`, "ok");
   } catch (e) {
     setStatus(e instanceof ScreenError ? e.message : `Something went wrong: ${e.message}`, "bad");
+    $("details").textContent = e.details ? `Details for your engineer: ${e.details}` : "";
   } finally {
     if (link) await link.close();
     busy = false;

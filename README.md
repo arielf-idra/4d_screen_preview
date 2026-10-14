@@ -14,7 +14,7 @@ Microsoft Edge. Safari doesn't support Web Serial.
 4. The first time, Chrome asks which device to use. Pick the one shown; it is
    remembered after that.
 
-A full screen takes about 14 seconds.
+A full screen takes about 18 seconds, including about 3.5 seconds while the screen restarts.
 
 ## How it works
 
