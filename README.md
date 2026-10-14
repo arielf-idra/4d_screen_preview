@@ -50,5 +50,5 @@ This replaces any Designer/ViSi program on the display.
 | Display | gen4-uLCD-32DCT-CLB (Diablo16), CP2102 USB adaptor, SPE at 115200 |
 | Colour order | RGB565, most significant byte first; no red/blue swap |
 | Protocol | Verified on the real screen from Windows with a test script; 13.5 s per frame |
-| This page | Not yet tested against the real screen |
+| This page | Works on the real screen from Chrome on Windows (2026-10-14) |
 | macOS | Not yet tested |
